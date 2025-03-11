@@ -13,7 +13,7 @@ categories = ["concurrency", "asynchronous", "data-structures"]
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-thiserror = "1.0"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -21,4 +21,8 @@ tokio-test = "0.4"
 [[example]]
 name = "simple"
 path = "examples/simple.rs"
+
+[[test]]
+name = "log_tests"
+path = "tests/mod.rs"
 

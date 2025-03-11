@@ -1,177 +1,203 @@
-use tokio::sync::Notify;
-use tokio::sync::Mutex;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::storage::{Error, Store, LSN};
+use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct Pos {
-    read: AtomicUsize,
-    write: AtomicUsize,
+pub struct LogBuffer {
+    write_pos: AtomicUsize,
+    buffer: Box<Vec<u8>>,
 }
 
-impl Pos {
-    pub fn new() -> Self {
-        Self {
-            read: AtomicUsize::new(0),
-            write: AtomicUsize::new(0),
-        }
-    }
-}
-pub struct LogBuffer<T: Store> {
-    pos : Pos,
-    lsn : LSN,
-    storage: Arc<Mutex<T>>,
-    buffer: Arc<[u8]>,
-    pending_writes: Mutex<HashMap<usize, Arc<Notify>>>,
-}
-
-impl<T: Store> LogBuffer<T> {
-    pub fn new(size: usize, storage: T) -> Arc<Self> {
-        Arc::new(Self {
-            pos: Pos::new(),
-            storage: Arc::new(Mutex::new(storage)),
-            lsn: LSN::new(0),
-            pending_writes: Mutex::new(HashMap::new()),
-            buffer: vec![0; size].into_boxed_slice().into(),
-        })
+impl LogBuffer {
+    pub fn new(buffer: Box<Vec<u8>>) -> Arc<Self> {
+        assert!(buffer.len() > 0, "Buffer size must be positive");
+        
+        let buffer = Arc::new(Self {
+            write_pos: AtomicUsize::new(0),
+            buffer: buffer.into(),
+        });
+        
+        buffer
     }
 
-    pub async fn reserve_and_write(self: &Arc<Self>, data: &[u8], require_lsn: bool) -> Result<usize, Error> {
-        let mut total_written = 0;
-        let mut remaining_data = data;
+    pub fn is_full(&self) -> bool {
+        assert!(self.write_pos.load(Ordering::Acquire) <= self.size(), "Write position is out of bounds");
+        self.write_pos.load(Ordering::Acquire) == self.size()
+    }
 
-        while !remaining_data.is_empty() {
-            let write_pos = self.pos.write.load(Ordering::Relaxed);
-            let read_pos = self.pos.read.load(Ordering::Acquire);
-            
-            // Calculate actual available space at these positions
-            let available_space = if write_pos >= read_pos {
-                self.buffer.len() - (write_pos - read_pos)
-            } else {
-                read_pos - write_pos
-            };
+    pub fn write_pos(&self) -> usize {
+        self.write_pos.load(Ordering::Acquire)
+    }
 
-            if available_space == 0 {
-                self.flush().await?;
-                continue;
-            }
+    pub fn buffer(&self) -> &[u8] {
+        &self.buffer[..self.write_pos.load(Ordering::Acquire)]
+    }
 
-            // Calculate how much we can write with these exact positions
-            let write_size = remaining_data.len().min(available_space);
-            let chunk = &remaining_data[..write_size];
-            let end_pos = (write_pos + write_size) % self.buffer.len();
+    pub fn try_reserve_space(&self, len: usize) -> Option<(usize, usize)> {
+        assert!(len > 0, "Cannot reserve zero bytes");
+        
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let available_space = self.size() - write_pos;
 
-            // Try to atomically reserve the space
-            match self.pos.write.compare_exchange_weak(
+        if len <= available_space {
+            // Try to atomically update write_pos
+            match self.write_pos.compare_exchange(
                 write_pos,
-                end_pos,
+                write_pos + len,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    // Double check that read_pos hasn't moved in a way that would
-                    // make our write unsafe
-                    let current_read_pos = self.pos.read.load(Ordering::Acquire);
-                    if current_read_pos != read_pos {
-                        // Read position changed, retry with new positions
-                        continue;
-                    }
-
-                    // Write position updated successfully and read position hasn't changed,
-                    // now copy the data
-                    if write_pos + write_size <= self.buffer.len() {
-                        // Simple case: no wrapping needed
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                chunk.as_ptr(),
-                                self.buffer[write_pos..].as_ptr() as *mut u8,
-                                write_size,
-                            );
-                        }
-                    } else {
-                        // Handle wrapping around the buffer end
-                        let first_part = self.buffer.len() - write_pos;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                chunk.as_ptr(),
-                                self.buffer[write_pos..].as_ptr() as *mut u8,
-                                first_part,
-                            );
-                            std::ptr::copy_nonoverlapping(
-                                chunk[first_part..].as_ptr(),
-                                self.buffer.as_ptr() as *mut u8,
-                                write_size - first_part,
-                            );
-                        }
-                    }
-
-                    // Update progress
-                    remaining_data = &remaining_data[write_size..];
-                    total_written += write_size;
-
-                    // If we've written everything and LSN is required, wait for it
-                    if remaining_data.is_empty() && require_lsn {
-                        self.wait_for_lsn(self.lsn.advance(total_written as i64)).await?;
-                    }
-                }
-                Err(_) => continue, // Another thread modified write pos, retry
+                Ok(_) => Some((write_pos, len)),
+                Err(_) => None,
             }
-        }
-
-        Ok(total_written)
-    }
-
-    async fn flush(self: &Arc<Self>) -> Result<(), Error> {
-        let read_pos = self.pos.read.load(Ordering::Relaxed);
-        let write_pos = self.pos.write.load(Ordering::Acquire);
-
-        if read_pos == write_pos {
-            return Ok(());
-        }
-
-        let data_to_flush: Vec<u8> = if read_pos < write_pos {
-            self.buffer[read_pos..write_pos].to_vec()
+        } else if available_space > 0 {
+            // Try to atomically update write_pos with remaining space
+            match self.write_pos.compare_exchange(
+                write_pos,
+                self.size(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Some((write_pos, available_space)),
+                Err(_) => None,
+            }
         } else {
-            let mut combined_data = Vec::with_capacity(self.buffer.len() - read_pos + write_pos);
-            combined_data.extend_from_slice(&self.buffer[read_pos..]);
-            combined_data.extend_from_slice(&self.buffer[..write_pos]);
-            combined_data
-        };
-
-        // Take a mutable reference to storage before the await point
-        let mut storage = self.storage.lock().await;
-        let _bytes_written = storage.persist(&data_to_flush).await?;
-
-        drop(storage); // Explicitly drop the guard
-
-        self.pos.read.store(write_pos, Ordering::Release);
-
-        let mut pending_writes = self.pending_writes.lock().await;
-        let positions: Vec<_> = pending_writes
-            .keys()
-            .filter(|&&pos| pos <= write_pos)
-            .copied()
-            .collect();
-
-        for pos in positions {
-            if let Some(notifier) = pending_writes.remove(&pos) {
-                notifier.notify_waiters();
-            }
+            None
         }
-
-        Ok(())
     }
 
-    async fn wait_for_lsn(self: &Arc<Self>, lsn: LSN) -> Result<(), Error> {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut pending_writes = self.pending_writes.lock().await;
-            pending_writes.insert(lsn.value() as usize, notify.clone());
-        }
+    /// Return the position of the data in the buffer
+    pub fn write(&self, pos: usize, data: &[u8]) {
+        assert!(!data.is_empty(), "Cannot write empty data");
+        assert!(pos + data.len() <= self.size(), "Write out of bounds");
 
-        notify.notified().await;
-        Ok(())
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.buffer[pos..].as_ptr() as *mut u8,
+                data.len(),
+            );
+        }
+    }
+
+    /// Clears the buffer by resetting the write position atomically
+    pub fn clear(&self) {
+        self.write_pos.store(0, Ordering::Release);
+    }
+
+    /// Prints a detailed debug view of the buffer's current state
+    pub fn print(&self) -> String {
+        let mut output = String::new();
+        
+        // Buffer metadata
+        let _ = writeln!(output, "LogBuffer State:");
+        let _ = writeln!(output, "Buffer size: {}", self.size());
+        
+        // Positions
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let _ = writeln!(output, "Write position: {}", write_pos);
+        
+        // Available space
+        let _ = writeln!(output, "Available space: {}", self.size() - write_pos);
+        
+        // Buffer contents visualization
+        let _ = writeln!(output, "\nBuffer contents:");
+        
+        // Data hexdump
+        let _ = writeln!(output, "\nData hexdump:");
+        let mut hex_output = String::new();
+        let mut ascii_output = String::new();
+        let mut count = 0;
+        
+        let dump_range = 0..write_pos;
+        let range_end = dump_range.end;
+        
+        for i in dump_range {
+            if count > 0 && count % 16 == 0 {
+                let _ = writeln!(output, "{:08x}: {:48} |{}|", 
+                    i - count, hex_output, ascii_output);
+                hex_output.clear();
+                ascii_output.clear();
+                count = 0;
+            }
+            
+            let byte = self.buffer[i];
+            let _ = write!(hex_output, "{:02x} ", byte);
+            ascii_output.push(if byte.is_ascii_graphic() {
+                byte as char
+            } else {
+                '.'
+            });
+            count += 1;
+        }
+        
+        // Print remaining bytes if any
+        if !hex_output.is_empty() {
+            let _ = writeln!(output, "{:08x}: {:48} |{}|",
+                range_end - count, hex_output, ascii_output);
+        }
+        
+        output
+    }
+
+    /// Returns the size of the buffer
+    pub(crate) fn size(&self) -> usize {
+        self.buffer.len()
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_buffer_operations() {
+        let data = "0123456789";
+        let buffer = Box::new(vec![0; 16]);
+        let log_buffer = LogBuffer::new(buffer);
+
+        {
+            let (pos, len) = log_buffer.try_reserve_space(data.len()).unwrap();
+
+            assert_eq!(pos, 0);
+            assert_eq!(len, data.len());
+
+            log_buffer.write(pos, data.as_bytes());
+
+            assert!(log_buffer.buffer[..data.len()].eq(data.as_bytes()));
+        }
+
+        {
+            let (pos, len) = log_buffer.try_reserve_space(data.len()).unwrap();
+
+            assert_eq!(pos, data.len());
+            assert_eq!(len, log_buffer.size() - data.len());
+
+            log_buffer.write(pos, data.as_bytes());
+
+            assert!(log_buffer.buffer[pos..pos + len].eq(&data.as_bytes()[..len]));
+        }
+
+        {
+            match log_buffer.try_reserve_space(data.len()) {
+                Some(_) => { panic!("Should not be able to reserve space"); }
+                None => { }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_print() {
+        let data = "0123456789ABCDEF";
+        let buffer = Box::new(vec![0; 16]);
+        let log_buffer = LogBuffer::new(buffer);
+
+        let (pos, len) = log_buffer.try_reserve_space(16).unwrap();
+
+        assert_eq!(pos, 0);
+        assert_eq!(len, data.len());
+
+        log_buffer.write(pos, data.as_bytes());
+
+        println!("{}", log_buffer.print());
+    }
+}

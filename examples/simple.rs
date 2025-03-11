@@ -1,5 +1,10 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
-use log_buffer::buffer::LogBuffer;
+use tokio::time;
+
+use log_buffer::log::Log;
 use log_buffer::storage::{Store, Error, LSN};
 
 struct NullStorage {
@@ -8,9 +13,9 @@ struct NullStorage {
 
 #[async_trait]
 impl Store for NullStorage {
-    async fn persist(&mut self, data: &[u8]) -> Result<usize, Error> {
-       self.lsn = self.lsn.advance(data.len() as i64);
-       Ok(data.len())
+    async fn persist<'a>(&'a mut self, buffer: &'a [u8]) -> Result<usize, Error> {
+       self.lsn = self.lsn.advance(buffer.len() as u64);
+       Ok(buffer.len())
     }
 
     async fn flush(&mut self) -> Result<LSN, Error> {
@@ -18,24 +23,58 @@ impl Store for NullStorage {
     }
 }
 
+async fn write_log(log: Arc<Log<NullStorage>>, id: usize) {
+    let data = format!("Hello from writer {}!", id);
+    for _ in 0..1024 {
+        match log.write(data.as_bytes()).await {
+            Ok(lsn) => println!("Writer {} got LSN: {}", id, lsn),
+            Err(e) => eprintln!("Writer {} failed: {}", id, e),
+        }
+    }
+    log.flush().await.unwrap();
+}
+
+async fn monitor_log_state(log: Arc<Log<NullStorage>>) {
+    let mut interval = time::interval(Duration::from_millis(100));
+    loop {
+        interval.tick().await;
+        println!("\n{}", log.print().await);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let storage = NullStorage { lsn: LSN::new(0) };
-    let buffer = LogBuffer::new(1024, storage);
-
-    let writer1 = buffer.clone();
-    let writer2 = buffer.clone();
-
-    tokio::spawn({ async move {
-        let lsn = writer1.reserve_and_write(b"Hello, World 1!", true).await;
-        println!("Writer1 got LSN: {}", lsn.unwrap());
-    }});
-
-    tokio::spawn(async move {
-        let lsn = writer2.reserve_and_write(b"Hello, World 2!", false).await;
-        println!("Writer2 got LSN: {}", lsn.unwrap());
+    let log = Arc::new(Log::new(LSN::new(0), 2, 64, storage));
+    
+    // Start the monitoring task
+    let monitor_log = log.clone();
+    let monitor_handle = tokio::spawn(async move {
+        monitor_log_state(monitor_log).await;
     });
+    
+    let mut handles = vec![];
+    
+    // Spawn concurrent writers
+    for i in 0..100 {
+        let log = log.clone();
+        handles.push(tokio::spawn(async move {
+            write_log(log, i).await;
+        }));
+    }
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Wait for all writers to complete
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    log.flush().await.unwrap();
+
+    // Print final state
+    //println!("\nFinal Log State:");
+    //println!("{}", log.print().await);
+    
+    // Stop the monitor
+    monitor_handle.abort();
 }
 
