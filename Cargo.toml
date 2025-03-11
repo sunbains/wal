@@ -1,0 +1,24 @@
+[package]
+name = "log_buffer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sunny Bains<sunny-github@bains.org>"]
+description = "A concurrent multi-writer, single-reader log buffer with async persistence support"
+license = "MIT"
+repository = "https://github.com/sunbains/log_buffer"
+readme = "README.md"
+keywords = ["log-buffer", "concurrent", "async", "persistence"]
+categories = ["concurrency", "asynchronous", "data-structures"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
