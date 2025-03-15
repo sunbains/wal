@@ -172,7 +172,7 @@ mod tests {
             assert_eq!(pos, data.len());
             assert_eq!(len, log_buffer.size() - data.len());
 
-            log_buffer.write(pos, data.as_bytes());
+            log_buffer.write(pos, &data[..len].as_bytes());
 
             assert!(log_buffer.buffer[pos..pos + len].eq(&data.as_bytes()[..len]));
         }
