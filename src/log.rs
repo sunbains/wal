@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64, AtomicI64};
+use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64, AtomicI64, AtomicBool};
 use crate::buffer::LogBuffer;
 use crate::storage::{Store, Error, LSN};
 use tokio::task;
@@ -164,6 +164,7 @@ pub struct Log<T: Store> {
     storage: Arc<Mutex<T>>,
     current_index: AtomicUsize,
     log_segments: Box<[LogSegment]>,
+    rotate_in_progress: AtomicBool,  // New atomic flag for rotation
 }
 
 impl<T: Store> Log<T> {
@@ -186,82 +187,72 @@ impl<T: Store> Log<T> {
             log_segments: Self::create_segments(num_segments, segment_size, lsn.value()),
             current_index: AtomicUsize::new(0),
             storage: Arc::new(Mutex::new(storage)),
+            rotate_in_progress: AtomicBool::new(false),
         }
     }
 
     async fn rotate(&self) -> Result<(), Error> {
         let current_index = self.current_index.load(Ordering::Acquire);
         let current_segment = &self.log_segments[current_index];
-        
-        // Keep trying until someone successfully transitions to WRITING
+        let next_index = (current_index + 1) % self.log_segments.len();
+        let next_segment = &self.log_segments[next_index];
+
+        // Try to acquire rotation lock
+        if !self.rotate_in_progress.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_ok() {
+            // Check if next segment is already active (rotation in progress)
+            if next_segment.get_state() == LogSegmentState::Active {
+                return Ok(());  // Can proceed with next segment
+            }
+            task::yield_now().await;
+            return Ok(());  // Let other tasks try
+        }
+
+        // We have the rotation lock
         loop {
             let current = current_segment.state_and_count.load(Ordering::Acquire);
             let state = current & LogSegment::STATE_MASK;
             let count = current >> LogSegment::COUNT_SHIFT;
 
-            // If not ACTIVE, someone else is rotating
-            if state != LogSegment::ACTIVE {
-                return Ok(());
-            }
-
-            // If there are still other writers, wait
-            if count > 0 {
+            // If not ACTIVE or writers still present, wait
+            if state != LogSegment::ACTIVE || count > 0 {
                 task::yield_now().await;
                 continue;
             }
 
-            // Try to transition from ACTIVE to WRITING
-            // At this point count should be 0 (we decremented ours already)
+            // Try to transition current from ACTIVE to WRITING
             let old_state = (0 << LogSegment::COUNT_SHIFT) | LogSegment::ACTIVE;
             let new_state = (0 << LogSegment::COUNT_SHIFT) | LogSegment::WRITING;
             
-            match current_segment.state_and_count.compare_exchange(
+            if current_segment.state_and_count.compare_exchange(
                 old_state,
                 new_state,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // Successfully transitioned to WRITING state
-                    // Now we can safely update the current index
-                    let new_index = (current_index + 1) % self.log_segments.len();
-                    self.current_index.store(new_index, Ordering::Release);
-                    
-                    // Persist the buffer
-                    let mut storage = self.storage.lock().await;
-                    let persisted_size = storage.persist(current_segment.buffer()).await?;
-                    current_segment.clear();
-                    drop(storage);
-                    
-                    // Update the base LSN of the next segment
-                    let next_base_lsn = current_segment.base_lsn() + persisted_size as u64;
-                    self.log_segments[new_index].set_base_lsn(next_base_lsn);
-                    
-                    // Transition from WRITING to QUEUED
-                    // Count is already 0
-                    let old_state = (0 << LogSegment::COUNT_SHIFT) | LogSegment::WRITING;
-                    let new_state = (0 << LogSegment::COUNT_SHIFT) | LogSegment::QUEUED;
-                    
-                    match current_segment.state_and_count.compare_exchange(
-                        old_state,
-                        new_state,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            // Set the new segment as ACTIVE
-                            self.log_segments[new_index].set_state(LogSegmentState::Active);
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            panic!("Failed to transition from WRITING to QUEUED - this should never happen");
-                        }
-                    }
-                }
-                Err(_) => {
-                    // CAS failed, try again
-                    continue;
-                }
+            ).is_ok() {
+                // Mark next segment as Active and update current index BEFORE persisting
+                next_segment.set_state(LogSegmentState::Active);
+                self.current_index.store(next_index, Ordering::Release);
+
+                // Update next segment's base LSN
+                let next_base_lsn = current_segment.base_lsn() + current_segment.buffer.write_pos() as u64;
+                next_segment.set_base_lsn(next_base_lsn);
+
+                // Persist the current segment asynchronously
+                let mut storage = self.storage.lock().await;
+                let _persisted_size = storage.persist(current_segment.buffer()).await?;
+                current_segment.clear();
+                drop(storage);
+
+                // Mark old segment as Queued and release rotation lock
+                current_segment.set_state(LogSegmentState::Queued);
+                self.rotate_in_progress.store(false, Ordering::Release);
+                
+                return Ok(());
             }
         }
     }
@@ -278,12 +269,13 @@ impl<T: Store> Log<T> {
             let log_segment = &self.log_segments[current_index];
 
             if log_segment.get_state() != LogSegmentState::Active {
-                // Somebody else is writing to this segment, yield to other tasks
+                // Segment not active, yield and retry
                 task::yield_now().await;
                 continue;
             }
 
             let Some((pos, len)) = log_segment.try_reserve_space(remaining_data.len()) else {
+                // Try to rotate if we can't reserve space
                 self.rotate().await?;
                 continue;
             };

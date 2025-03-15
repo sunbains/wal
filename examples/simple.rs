@@ -35,7 +35,7 @@ async fn write_log(log: Arc<Log<NullStorage>>, id: usize) {
 }
 
 async fn monitor_log_state(log: Arc<Log<NullStorage>>) {
-    let mut interval = time::interval(Duration::from_millis(100));
+    let mut interval = time::interval(Duration::from_millis(1000));
     loop {
         interval.tick().await;
         println!("\n{}", log.print().await);

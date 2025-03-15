@@ -21,10 +21,11 @@ VARIABLES
     writerCounts,    \* Array of writer counts per segment
     currentIndex,    \* Current active segment index
     lsns,           \* Array of base LSNs for each segment
-    writePositions, \* Array of write positions in each segment
-    pc             \* Program counter for each process
+    writePositions,  \* Array of write positions in each segment
+    pc,             \* Program counter for each process
+    rotateInProgress \* Atomic flag to prevent concurrent rotations
 
-vars == <<segments, writerCounts, currentIndex, lsns, writePositions, pc>>
+vars == <<segments, writerCounts, currentIndex, lsns, writePositions, pc, rotateInProgress>>
 
 \* --------------------------- Type Invariants ---------------------------
 TypeOK == 
@@ -34,6 +35,7 @@ TypeOK ==
     /\ lsns \in [0..(NumSegments-1) -> Nat]
     /\ writePositions \in [0..(NumSegments-1) -> 0..SegmentSize]
     /\ pc \in [1..NumWriters -> {"Write", "TryReserve", "Rotate", "Done"}]
+    /\ rotateInProgress \in BOOLEAN
 
 \* ---------------------------- Initial State ----------------------------
 Init ==
@@ -43,6 +45,7 @@ Init ==
     /\ lsns = [i \in 0..(NumSegments-1) |-> InitialLSN]  \* All segments start at InitialLSN
     /\ writePositions = [i \in 0..(NumSegments-1) |-> 0]
     /\ pc = [w \in 1..NumWriters |-> "TryReserve"]
+    /\ rotateInProgress = FALSE
 
 \* ---------------------------- Actions ---------------------------------
 
@@ -55,26 +58,43 @@ TryReserve(w) ==
              /\ writerCounts[idx] < SegmentSize - writePositions[idx]  \* Enough space for all reservations
           THEN /\ writerCounts' = [writerCounts EXCEPT ![idx] = @ + 1]
                /\ pc' = [pc EXCEPT ![w] = "Write"]
-               /\ UNCHANGED <<segments, currentIndex, lsns, writePositions>>
-          ELSE /\ pc' = [pc EXCEPT ![w] = "Rotate"]
-               /\ UNCHANGED <<segments, writerCounts, currentIndex, lsns, writePositions>>
+               /\ UNCHANGED <<segments, currentIndex, lsns, writePositions, rotateInProgress>>
+          ELSE \* Try to rotate if segment is full or insufficient space
+               /\ \/ rotateInProgress = FALSE  \* Can initiate rotation
+                  \/ /\ rotateInProgress = TRUE  \* Rotation in progress
+                     /\ LET newIdx == (idx + 1) % NumSegments IN
+                        /\ segments[newIdx] = "Active"  \* Next segment is already active
+               /\ pc' = [pc EXCEPT ![w] = "Rotate"]
+               /\ UNCHANGED <<segments, writerCounts, currentIndex, lsns, writePositions, rotateInProgress>>
 
-\* Rotate to a new segment
+\* Try to rotate to a new segment
 Rotate(w) ==
     /\ pc[w] = "Rotate"
     /\ LET idx == currentIndex
-           newIdx == (currentIndex + 1) % NumSegments IN
-       /\ segments[idx] = "Active"
-       /\ writePositions[idx] >= SegmentSize
-       /\ writerCounts[idx] = 0
-       /\ segments' = [segments EXCEPT 
-            ![idx] = "Writing",
-            ![newIdx] = "Active"]
-       /\ currentIndex' = newIdx
-       /\ lsns' = [lsns EXCEPT ![newIdx] = lsns[idx] + writePositions[idx]]  \* New segment starts at previous segment's final LSN
-       /\ writePositions' = [writePositions EXCEPT ![idx] = 0]
-       /\ pc' = [pc EXCEPT ![w] = "TryReserve"]
-       /\ UNCHANGED writerCounts
+           newIdx == (idx + 1) % NumSegments
+       IN
+       \/ \* Case 1: Rotation already in progress, check if we can use next segment
+          /\ rotateInProgress = TRUE
+          /\ \/ \* Next segment is active, try to reserve there
+                /\ segments[newIdx] = "Active"
+                /\ pc' = [pc EXCEPT ![w] = "TryReserve"]
+                /\ UNCHANGED <<segments, writerCounts, currentIndex, lsns, writePositions, rotateInProgress>>
+             \/ \* Next segment not ready, keep waiting
+                /\ segments[newIdx] # "Active"
+                /\ UNCHANGED vars
+       \/ \* Case 2: Start rotation if not in progress
+          /\ rotateInProgress = FALSE
+          /\ writerCounts[idx] = 0  \* No active writers in current segment
+          /\ segments[newIdx] = "Queued"  \* Next segment must be queued
+          /\ rotateInProgress' = TRUE
+          /\ segments' = [segments EXCEPT 
+                 ![idx] = "Writing",     \* Mark current as Writing
+                 ![newIdx] = "Active"]   \* Mark next as Active immediately
+          /\ currentIndex' = newIdx
+          /\ lsns' = [lsns EXCEPT ![newIdx] = lsns[idx] + writePositions[idx]]
+          /\ writePositions' = [writePositions EXCEPT ![newIdx] = 0]
+          /\ pc' = [pc EXCEPT ![w] = "TryReserve"]
+          /\ UNCHANGED writerCounts
 
 \* Write data to the current segment
 Write(w) ==
@@ -86,21 +106,31 @@ Write(w) ==
        /\ writePositions' = [writePositions EXCEPT ![idx] = @ + 1]
        /\ writerCounts' = [writerCounts EXCEPT ![idx] = @ - 1]
        /\ pc' = [pc EXCEPT ![w] = "Done"]
-       /\ UNCHANGED <<segments, currentIndex, lsns>>
+       /\ UNCHANGED <<segments, currentIndex, lsns, rotateInProgress>>
 
 \* Complete a write operation
 Complete(w) ==
     /\ pc[w] = "Done"
     /\ pc' = [pc EXCEPT ![w] = "TryReserve"]
-    /\ UNCHANGED <<segments, writerCounts, currentIndex, lsns, writePositions>>
+    /\ UNCHANGED <<segments, writerCounts, currentIndex, lsns, writePositions, rotateInProgress>>
+
+\* Complete rotation and release the lock
+CompleteRotation ==
+    /\ rotateInProgress = TRUE
+    /\ \E i \in 0..(NumSegments-1):
+        /\ segments[i] = "Writing"  \* Find segment being rotated
+        /\ segments' = [segments EXCEPT ![i] = "Queued"]  \* Mark it as queued
+        /\ rotateInProgress' = FALSE  \* Release the lock
+        /\ UNCHANGED <<writerCounts, currentIndex, lsns, writePositions, pc>>
 
 \* Next state relation
 Next ==
-    \E w \in 1..NumWriters:
+    \/ \E w \in 1..NumWriters:
         \/ TryReserve(w)
         \/ Rotate(w)
         \/ Write(w)
         \/ Complete(w)
+    \/ CompleteRotation
 
 \* Fairness conditions
 Fairness ==
@@ -108,6 +138,7 @@ Fairness ==
     /\ \A w \in 1..NumWriters: WF_vars(Write(w))
     /\ \A w \in 1..NumWriters: WF_vars(Complete(w))
     /\ \A w \in 1..NumWriters: SF_vars(Rotate(w))
+    /\ WF_vars(CompleteRotation)
 
 \* Specification with fairness
 Spec == Init /\ [][Next]_vars /\ Fairness
