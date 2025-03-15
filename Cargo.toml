@@ -21,8 +21,3 @@ tokio-test = "0.4"
 [[example]]
 name = "simple"
 path = "examples/simple.rs"
-
-[[test]]
-name = "log_tests"
-path = "tests/mod.rs"
-
