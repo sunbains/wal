@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.65%2B-blue)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Build](https://github.com/sunbains/log_buffer/actions/workflows/rust.yml/badge.svg)](https://github.com/sunbains/log_buffer/actions)
+[![Build](https://github.com/sunbains/wal/actions/workflows/rust.yml/badge.svg)](https://github.com/sunbains/wal/actions)
 
 A high-performance, **multi-writer log** with **async persistence support**.  
 It allows **multiple writers** to concurrently write to the buffer.
@@ -21,7 +21,7 @@ To use this library in your Rust project, add the following to your `Cargo.toml`
 
 ```toml
 [dependencies]
-log_buffer = { git = "https://github.com/sunbains/log_buffer" }
+wal = { git = "https://github.com/sunbains/wal" }
 ```
 
 # Write-Ahead Log TLA+ Specification
