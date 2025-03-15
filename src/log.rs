@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64, AtomicI64};
-use std::ops::Deref;
 use crate::buffer::LogBuffer;
 use crate::storage::{Store, Error, LSN};
 use tokio::task;
@@ -158,24 +157,6 @@ impl LogSegment {
 
     fn clear(&self) {
         self.buffer.clear();
-    }
-}
-
-impl Clone for LogSegment {
-    fn clone(&self) -> Self {
-        Self {
-            buffer: self.buffer.clone(),
-            state_and_count: AtomicI64::new(self.state_and_count.load(Ordering::Acquire)),
-            base_lsn: AtomicU64::new(self.base_lsn.load(Ordering::Acquire)),
-        }
-    }
-}
-
-impl Deref for LogSegment {
-    type Target = LogBuffer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
     }
 }
 
